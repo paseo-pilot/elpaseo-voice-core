@@ -1,0 +1,11 @@
+{
+  "name": "elpaseo-voice-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private local voice core for Twilio relay realtime duplex/barge-in orchestration",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "MIT"
+}
