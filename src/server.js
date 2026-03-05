@@ -7,6 +7,9 @@ const BEARER = process.env.VOICE_CORE_BEARER_TOKEN || '';
 
 const sessions = new Map();
 
+const VAD_THRESHOLD = Number(process.env.VOICE_CORE_VAD_THRESHOLD || 0.12);
+const VAD_MIN_FRAMES = Number(process.env.VOICE_CORE_VAD_MIN_FRAMES || 3);
+
 function log(msg, extra = {}) {
   const line = JSON.stringify({ ts: new Date().toISOString(), msg, ...extra });
   console.log(line);
@@ -89,6 +92,30 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
+function muLawDecode(muLaw) {
+  muLaw = (~muLaw) & 0xff;
+  const sign = muLaw & 0x80;
+  const exponent = (muLaw >> 4) & 0x07;
+  const mantissa = muLaw & 0x0f;
+  let sample = ((mantissa << 4) + 0x08) << exponent;
+  sample -= 0x84;
+  return sign ? -sample : sample;
+}
+
+function computeMulawEnergyFromB64(payloadB64) {
+  try {
+    const buf = Buffer.from(payloadB64 || '', 'base64');
+    if (!buf.length) return 0;
+    let sum = 0;
+    for (const b of buf) {
+      sum += Math.abs(muLawDecode(b)) / 32768;
+    }
+    return sum / buf.length;
+  } catch {
+    return 0;
+  }
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -150,7 +177,12 @@ server.on('upgrade', (req, socket) => {
 
       if (msg.type === 'session-start') {
         callSid = msg.callSid || null;
-        if (callSid) sessions.set(callSid, { startedAt: Date.now(), streamSid: msg.streamSid || null });
+        if (callSid) sessions.set(callSid, {
+          startedAt: Date.now(),
+          streamSid: msg.streamSid || null,
+          assistantSpeaking: false,
+          vadFrames: 0,
+        });
         log('session-start', { callSid: msg.callSid, streamSid: msg.streamSid });
         socket.write(encodeWsTextFrame(JSON.stringify({ type: 'session-ack', callSid: msg.callSid })));
         continue;
@@ -162,11 +194,50 @@ server.on('upgrade', (req, socket) => {
         continue;
       }
 
+      if (msg.type === 'playback-start' || msg.type === 'playback-started') {
+        const state = sessions.get(msg.callSid || callSid);
+        if (state) {
+          state.assistantSpeaking = true;
+          state.vadFrames = 0;
+        }
+        continue;
+      }
+
+      if (msg.type === 'playback-stop' || msg.type === 'playback.stopped') {
+        const state = sessions.get(msg.callSid || callSid);
+        if (state) {
+          state.assistantSpeaking = false;
+          state.vadFrames = 0;
+        }
+        continue;
+      }
+
       if (msg.type === 'twilio-media') {
-        // Placeholder for future duplex/barge-in logic:
-        // - VAD on inbound media
-        // - emit {type:"bargein.detected"}
-        // - stream assistant audio back as {type:"audio", payload:"<mulaw b64>"}
+        const state = sessions.get(msg.callSid || callSid);
+        if (!state) continue;
+
+        // First-pass VAD-based barge-in detector.
+        if (state.assistantSpeaking && (msg.track === 'inbound' || !msg.track)) {
+          const energy = computeMulawEnergyFromB64(msg.payload || '');
+          if (energy >= VAD_THRESHOLD) {
+            state.vadFrames += 1;
+          } else {
+            state.vadFrames = 0;
+          }
+
+          if (state.vadFrames >= VAD_MIN_FRAMES) {
+            state.vadFrames = 0;
+            state.assistantSpeaking = false;
+            socket.write(encodeWsTextFrame(JSON.stringify({
+              type: 'bargein.detected',
+              callSid: msg.callSid || callSid,
+              streamSid: msg.streamSid || state.streamSid || null,
+              energy,
+            })));
+            log('bargein-detected', { callSid: msg.callSid || callSid, energy });
+          }
+        }
+
         continue;
       }
     }
